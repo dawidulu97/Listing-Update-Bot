@@ -1,126 +1,131 @@
-import os
 import feedparser
 import requests
 import time
 from datetime import datetime
-from telegram import Bot, Update
-from telegram.ext import Updater, CommandHandler
+from telegram import Bot
+import logging
 
 # Configuration
 TELEGRAM_TOKEN = "7900731557:AAH11XcaZXxnax9MrtFPsd_VUBEkT6NJkCo"
 CHAT_ID = "6848532238"
 EBAY_RSS_URL = "https://www.ebay.com/sch/i.html?_saslop=1&_sasl=eliminatethedigitaldivide&_rss=1"
 CHECK_INTERVAL = 300  # 5 minutes
-MAX_INITIAL_ITEMS = 5  # Number of current listings to show at startup
+MAX_INITIAL_ITEMS = 5
 
-# Track last seen items
-last_items = set()
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 bot = Bot(token=TELEGRAM_TOKEN)
+last_items = set()
 
 def send_message(text):
-    """Helper function to send Telegram messages"""
-    bot.send_message(chat_id=CHAT_ID, text=text)
+    """Send message with error handling"""
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=text)
+    except Exception as e:
+        logger.error(f"Failed to send message: {e}")
 
 def get_feed_items():
-    """Fetch and parse RSS feed items with better error handling"""
+    """Improved RSS feed parser with better item detection"""
     try:
         feed = feedparser.parse(EBAY_RSS_URL)
         if not feed.entries:
-            print("Debug: Feed entries empty - feed status", feed.get('status', 'No status'))
-            print("Debug: Feed contents:", feed)
+            logger.warning(f"No entries found in feed. Feed status: {feed.get('status')}")
             return []
-            
+
         items = []
         for entry in feed.entries:
-            # Some eBay RSS feeds use 'link', others use 'guid'
-            link = entry.get('link') or entry.get('guid', '')
+            # Extract item ID from link or guid
+            link = entry.get('link', '')
             if not link:
-                continue
-            title = entry.get('title', 'No Title')
-            pub_date = entry.get('published', '')
-            items.append((link, title, pub_date))
+                link = entry.get('guid', '')
             
-        return items
+            # Some eBay feeds put title in description
+            title = entry.get('title', '') or entry.get('description', 'No Title')
+            
+            # Clean up title
+            title = ' '.join(title.split())  # Remove extra whitespace
+            
+            # Get publication date
+            pub_date = entry.get('published', '')
+            
+            if link:
+                items.append((link, title, pub_date))
         
+        logger.info(f"Found {len(items)} items in feed")
+        return items
+
     except Exception as e:
-        print(f"Error parsing feed: {str(e)}")
+        logger.error(f"Error parsing feed: {e}")
+        send_message(f"⚠️ Feed parsing error: {str(e)}")
         return []
 
 def format_item(title, link, pub_date=""):
-    """Format item for Telegram message"""
+    """Format item message with emoji"""
     date_str = f"\n⌚ {pub_date}" if pub_date else ""
-    return f"🆕 {title}{date_str}\n🔗 {link}"
-
-def show_current_listings():
-    """Display current listings when bot starts"""
-    try:
-        items = get_feed_items()
-        if not items:
-            send_message("ℹ️ No current listings found - this may be incorrect. Checking feed format...")
-            # Send debug info to help troubleshoot
-            feed = feedparser.parse(EBAY_RSS_URL)
-            send_message(f"Feed status: {feed.get('status', 'Unknown')}\nFeed URL: {EBAY_RSS_URL}")
-            return
-
-        send_message(f"📋 Current Listings (Showing {min(MAX_INITIAL_ITEMS, len(items))} most recent):")
-        
-        for link, title, pub_date in items[:MAX_INITIAL_ITEMS]:
-            send_message(format_item(title, link, pub_date))
-            time.sleep(0.5)  # Avoid rate limits
-
-        # Initialize last_items with current items
-        global last_items
-        last_items = {link for link, _, _ in items}
-        
-    except Exception as e:
-        send_message(f"❌ Error fetching current listings: {str(e)}")
+    return f"🛍️ {title}{date_str}\n🔗 {link}"
 
 def check_new_listings():
-    """Check for and notify about new listings"""
+    """Check for new listings and notify"""
     global last_items
     
     try:
         current_items = get_feed_items()
         if not current_items:
+            logger.info("No items found in current check")
             return
 
-        current_links = {link for link, _, _ in current_items}
+        current_links = {item[0] for item in current_items}
         new_links = current_links - last_items
 
         if new_links:
-            send_message(f"🔔 New Items Found ({len(new_links)})")
+            send_message(f"🎉 New Item Found!")
             for link, title, pub_date in current_items:
                 if link in new_links:
                     send_message(format_item(title, link, pub_date))
-                    time.sleep(0.5)
+                    time.sleep(1)  # Rate limiting
             
             last_items = current_links
-            
-    except Exception as e:
-        send_message(f"❌ Error checking new listings: {str(e)}")
+        else:
+            logger.info("No new items detected")
 
-def start(update: Update, context):
-    """Handle /start command"""
-    update.message.reply_text('🔄 Starting eBay Monitor...')
-    show_current_listings()
+    except Exception as e:
+        logger.error(f"Error in check_new_listings: {e}")
+        send_message(f"❌ Error checking listings: {str(e)}")
 
 def main():
-    """Run the bot"""
-    # Send startup notification
+    """Main bot function"""
     send_message(f"🤖 eBay Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     
-    # Show current listings
-    show_current_listings()
-    
-    # Set up command handler
-    updater = Updater(TELEGRAM_TOKEN)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start))
-    
-    # Start periodic checking
+    # Initial check
+    initial_items = get_feed_items()
+    if initial_items:
+        send_message(f"📋 Found {len(initial_items)} current listings:")
+        for link, title, pub_date in initial_items[:MAX_INITIAL_ITEMS]:
+            send_message(format_item(title, link, pub_date))
+            time.sleep(1)
+        
+        global last_items
+        last_items = {item[0] for item in initial_items}
+    else:
+        send_message("ℹ️ No current listings found")
+        # Send debug info
+        feed = feedparser.parse(EBAY_RSS_URL)
+        send_message(f"Feed status: {feed.get('status', 'Unknown')}\nEntries: {len(feed.entries)}")
+
+    # Start monitoring loop
     while True:
         check_new_listings()
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        send_message(f"🆘 Bot crashed: {str(e)}")
+        raise
