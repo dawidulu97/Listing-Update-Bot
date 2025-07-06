@@ -3,7 +3,9 @@ import requests
 import time
 from datetime import datetime
 from telegram import Bot
+from telegram.error import TelegramError
 import logging
+import asyncio
 
 # Configuration
 TELEGRAM_TOKEN = "7900731557:AAH11XcaZXxnax9MrtFPsd_VUBEkT6NJkCo"
@@ -23,26 +25,33 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TELEGRAM_TOKEN)
 last_items = set()
 
-def send_message(text):
+async def send_message(text):
+    """Proper async message sending with error handling"""
     try:
-        bot.send_message(chat_id=CHAT_ID, text=text)
-    except Exception as e:
+        await bot.send_message(chat_id=CHAT_ID, text=text)
+    except TelegramError as e:
         logger.error(f"Failed to send message: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error sending message: {e}")
 
 def get_rss_items():
-    """Parse RSS feed with proper error handling"""
+    """Parse RSS feed with improved error handling"""
     try:
         feed = feedparser.parse(EBAY_RSS_URL)
-        if feed.bozo:  # Check for feed parsing errors
-            logger.error(f"RSS feed error: {feed.bozo_exception}")
+        if feed.bozo and feed.bozo_exception:
+            logger.error(f"RSS feed error: {str(feed.bozo_exception)}")
             return []
             
         items = []
         for entry in feed.entries:
-            link = entry.get('link', '') or entry.get('guid', '')
-            title = (entry.get('title', '') or '').strip()
-            if link and "prodesk" in title.lower():
-                items.append((link, title))
+            try:
+                link = entry.get('link', '') or entry.get('guid', '')
+                title = (entry.get('title', '') or '').strip()
+                if link and "prodesk" in title.lower():
+                    items.append((link, title))
+            except Exception as e:
+                logger.error(f"Error processing RSS entry: {e}")
+                continue
         
         logger.info(f"Found {len(items)} items in RSS")
         return items
@@ -52,10 +61,10 @@ def get_rss_items():
         return []
 
 def get_store_items():
-    """Fallback to direct store page scraping"""
+    """Fallback to direct store page with better timeout handling"""
     try:
         headers = {'User-Agent': USER_AGENT}
-        response = requests.get(EBAY_STORE_URL, headers=headers, timeout=10)
+        response = requests.get(EBAY_STORE_URL, headers=headers, timeout=15)
         response.raise_for_status()
         
         # Simple text search as fallback
@@ -63,14 +72,18 @@ def get_store_items():
             return [(EBAY_STORE_URL, "HP ProDesk (found via store page)")]
         return []
         
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         logger.error(f"Store page error: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected store page error: {e}")
         return []
 
 def format_item(title, link):
     return f"🖥️ HP ProDesk Alert!\n{title}\n🔗 {link}"
 
-def check_listings():
+async def check_listings():
+    """Async version of listing checker"""
     global last_items
     
     try:
@@ -89,43 +102,45 @@ def check_listings():
         new_links = current_links - last_items
 
         if new_links:
-            send_message("🎉 New HP ProDesk Found!")
+            await send_message("🎉 New HP ProDesk Found!")
             for link, title in current_items:
                 if link in new_links:
-                    send_message(format_item(title, link))
-                    time.sleep(1)
+                    await send_message(format_item(title, link))
+                    await asyncio.sleep(1)  # Rate limiting
             
             last_items = current_links
             
     except Exception as e:
         logger.error(f"Check error: {e}")
-        send_message(f"⚠️ Temporary error: {str(e)[:100]}...")
+        await send_message(f"⚠️ Temporary error: {str(e)[:100]}...")
 
-def main():
-    send_message(f"🤖 HP ProDesk Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+async def main():
+    """Async main function"""
+    await send_message(f"🤖 HP ProDesk Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     
     # Initial check
     initial_items = get_rss_items() or get_store_items()
     if initial_items:
-        send_message(f"📋 Found {len(initial_items)} current listings:")
+        await send_message(f"📋 Found {len(initial_items)} current listings:")
         for link, title in initial_items:
-            send_message(format_item(title, link))
-            time.sleep(1)
+            await send_message(format_item(title, link))
+            await asyncio.sleep(1)
         
         global last_items
         last_items = {item[0] for item in initial_items}
     else:
-        send_message("ℹ️ No current listings found. Monitoring for new items...")
+        await send_message("ℹ️ No current listings found. Monitoring for new items...")
 
     # Monitoring loop
     while True:
-        check_listings()
-        time.sleep(CHECK_INTERVAL)
+        await check_listings()
+        await asyncio.sleep(CHECK_INTERVAL)
 
 if __name__ == '__main__':
     try:
-        main()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-        send_message(f"🆘 Bot crashed: {str(e)}")
-        raise
+        # Can't send message here since event loop is closing
