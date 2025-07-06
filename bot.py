@@ -1,16 +1,17 @@
-import feedparser
 import requests
+from bs4 import BeautifulSoup
 import time
 from datetime import datetime
 from telegram import Bot
 import logging
+import feedparser
 
 # Configuration
 TELEGRAM_TOKEN = "7900731557:AAH11XcaZXxnax9MrtFPsd_VUBEkT6NJkCo"
 CHAT_ID = "6848532238"
-EBAY_RSS_URL = "https://www.ebay.com/sch/i.html?_saslop=1&_sasl=eliminatethedigitaldivide&_rss=1"
+EBAY_URL = "https://www.ebay.com/str/eliminatethedigitaldivide"
 CHECK_INTERVAL = 300  # 5 minutes
-MAX_INITIAL_ITEMS = 5
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
 # Setup logging
 logging.basicConfig(
@@ -23,103 +24,121 @@ bot = Bot(token=TELEGRAM_TOKEN)
 last_items = set()
 
 def send_message(text):
-    """Send message with error handling"""
     try:
         bot.send_message(chat_id=CHAT_ID, text=text)
     except Exception as e:
         logger.error(f"Failed to send message: {e}")
 
-def get_feed_items():
-    """Improved RSS feed parser with better item detection"""
+def get_html_items():
+    """Parse items directly from HTML as fallback"""
     try:
-        feed = feedparser.parse(EBAY_RSS_URL)
-        if not feed.entries:
-            logger.warning(f"No entries found in feed. Feed status: {feed.get('status')}")
-            return []
-
-        items = []
-        for entry in feed.entries:
-            # Extract item ID from link or guid
-            link = entry.get('link', '')
-            if not link:
-                link = entry.get('guid', '')
-            
-            # Some eBay feeds put title in description
-            title = entry.get('title', '') or entry.get('description', 'No Title')
-            
-            # Clean up title
-            title = ' '.join(title.split())  # Remove extra whitespace
-            
-            # Get publication date
-            pub_date = entry.get('published', '')
-            
-            if link:
-                items.append((link, title, pub_date))
+        headers = {'User-Agent': USER_AGENT}
+        response = requests.get(EBAY_URL, headers=headers)
+        response.raise_for_status()
         
-        logger.info(f"Found {len(items)} items in feed")
+        soup = BeautifulSoup(response.text, 'html.parser')
+        items = []
+        
+        # Try different selectors for eBay listings
+        for selector in ['.s-item', '.srp-results .s-item']:
+            listings = soup.select(selector)
+            if listings:
+                break
+                
+        for item in listings:
+            try:
+                title_elem = item.select_one('.s-item__title')
+                link_elem = item.select_one('.s-item__link')
+                
+                if title_elem and link_elem:
+                    title = title_elem.get_text(strip=True)
+                    link = link_elem['href']
+                    
+                    # Skip "Shop on eBay" and similar non-item links
+                    if "ebay.com" in link and "prodesk" in title.lower():
+                        items.append((link, title))
+            except Exception as e:
+                logger.error(f"Error parsing item: {e}")
+        
+        logger.info(f"Found {len(items)} items in HTML")
         return items
-
+        
     except Exception as e:
-        logger.error(f"Error parsing feed: {e}")
-        send_message(f"⚠️ Feed parsing error: {str(e)}")
+        logger.error(f"HTML parsing error: {e}")
         return []
 
-def format_item(title, link, pub_date=""):
-    """Format item message with emoji"""
-    date_str = f"\n⌚ {pub_date}" if pub_date else ""
-    return f"🛍️ {title}{date_str}\n🔗 {link}"
+def get_rss_items():
+    """Try RSS feed first, fallback to HTML"""
+    try:
+        feed = feedparser.parse(EBAY_RSS_URL)
+        if feed.entries:
+            items = []
+            for entry in feed.entries:
+                link = entry.get('link', '') or entry.get('guid', '')
+                title = entry.get('title', 'No Title')
+                if link:
+                    items.append((link, title))
+            logger.info(f"Found {len(items)} items in RSS")
+            return items
+    except Exception as e:
+        logger.error(f"RSS parsing error: {e}")
+    
+    return get_html_items()
 
-def check_new_listings():
-    """Check for new listings and notify"""
+def format_item(title, link):
+    return f"🖥️ {title}\n🔗 {link}"
+
+def check_listings():
     global last_items
     
     try:
-        current_items = get_feed_items()
+        current_items = get_rss_items()
         if not current_items:
-            logger.info("No items found in current check")
-            return
+            logger.warning("No items found in either RSS or HTML")
+            send_message("⚠️ Couldn't find any listings. Checking HTML directly...")
+            current_items = get_html_items()
+            if not current_items:
+                send_message("❌ Still no items found. Please check the seller's page manually.")
+                return
 
         current_links = {item[0] for item in current_items}
         new_links = current_links - last_items
 
         if new_links:
-            send_message(f"🎉 New Item Found!")
-            for link, title, pub_date in current_items:
+            send_message(f"🎉 Found {len(new_links)} new items!")
+            for link, title in current_items:
                 if link in new_links:
-                    send_message(format_item(title, link, pub_date))
-                    time.sleep(1)  # Rate limiting
+                    send_message(format_item(title, link))
+                    time.sleep(1)
             
             last_items = current_links
         else:
             logger.info("No new items detected")
 
     except Exception as e:
-        logger.error(f"Error in check_new_listings: {e}")
-        send_message(f"❌ Error checking listings: {str(e)}")
+        logger.error(f"Error in check_listings: {e}")
+        send_message(f"❌ Error: {str(e)}")
 
 def main():
-    """Main bot function"""
-    send_message(f"🤖 eBay Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    send_message(f"🤖 HP ProDesk Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     
     # Initial check
-    initial_items = get_feed_items()
+    initial_items = get_rss_items() or get_html_items()
     if initial_items:
         send_message(f"📋 Found {len(initial_items)} current listings:")
-        for link, title, pub_date in initial_items[:MAX_INITIAL_ITEMS]:
-            send_message(format_item(title, link, pub_date))
-            time.sleep(1)
+        for link, title in initial_items[:5]:
+            if "prodesk" in title.lower():
+                send_message(format_item(title, link))
+                time.sleep(1)
         
         global last_items
         last_items = {item[0] for item in initial_items}
     else:
-        send_message("ℹ️ No current listings found")
-        # Send debug info
-        feed = feedparser.parse(EBAY_RSS_URL)
-        send_message(f"Feed status: {feed.get('status', 'Unknown')}\nEntries: {len(feed.entries)}")
+        send_message("ℹ️ No current listings found. Will keep checking...")
 
-    # Start monitoring loop
+    # Monitoring loop
     while True:
-        check_new_listings()
+        check_listings()
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == '__main__':
