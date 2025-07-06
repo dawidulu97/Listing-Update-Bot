@@ -1,16 +1,16 @@
 import requests
+import re
 import time
 from datetime import datetime
 from telegram import Bot
 from telegram.error import TelegramError
 import logging
 import asyncio
-import re
 
 # Configuration
 TELEGRAM_TOKEN = "7900731557:AAH11XcaZXxnax9MrtFPsd_VUBEkT6NJkCo"
 CHAT_ID = "6848532238"
-EBAY_SEARCH_URL = "https://www.ebay.com/sch/i.html?_nkw=hp+prodesk&_saslop=1&_sasl=eliminatethedigitaldivide"
+SELLER_URL = "https://www.ebay.com/str/eliminatethedigitaldivide"
 CHECK_INTERVAL = 300  # 5 minutes
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
@@ -25,7 +25,6 @@ bot = Bot(token=TELEGRAM_TOKEN)
 last_items = set()
 
 async def send_message(text):
-    """Proper async message sending with error handling"""
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text)
     except TelegramError as e:
@@ -33,91 +32,80 @@ async def send_message(text):
     except Exception as e:
         logger.error(f"Unexpected error sending message: {e}")
 
-def get_listings():
-    """Get listings through direct HTML scraping with robust error handling"""
+def extract_listings(html):
+    """Extract all listings from HTML"""
+    items = []
+    pattern = re.compile(
+        r'<li class="s-item.*?<a href="(.*?)".*?<span role="heading".*?>(.*?)</span>.*?<span class="s-item__price">(.*?)</span>',
+        re.DOTALL
+    )
+    
+    for match in pattern.finditer(html):
+        link, title, price = match.groups()
+        title = re.sub(r'<.*?>', '', title).strip()
+        price = re.sub(r'<.*?>', '', price).strip()
+        items.append((link, title, price))
+    
+    return items
+
+def get_current_listings():
+    """Get all current listings from seller page"""
     try:
-        headers = {
-            'User-Agent': USER_AGENT,
-            'Accept': 'text/html,application/xhtml+xml',
-            'Accept-Language': 'en-US,en;q=0.9',
-        }
-        
-        response = requests.get(
-            EBAY_SEARCH_URL,
-            headers=headers,
-            timeout=15
-        )
+        headers = {'User-Agent': USER_AGENT}
+        response = requests.get(SELLER_URL, headers=headers, timeout=15)
         response.raise_for_status()
-        
-        # Basic HTML parsing with regex (no BeautifulSoup dependency)
-        items = []
-        item_pattern = re.compile(r'<li class="s-item.*?<a href="(.*?)".*?<span role="heading".*?>(.*?)</span>', re.DOTALL)
-        
-        for match in item_pattern.finditer(response.text):
-            link, title = match.groups()
-            title = re.sub(r'<.*?>', '', title).strip()  # Remove HTML tags
-            if "prodesk" in title.lower():
-                items.append((link, title))
-        
-        logger.info(f"Found {len(items)} HP ProDesk listings")
-        return items
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error: {e}")
-        return []
+        return extract_listings(response.text)
     except Exception as e:
-        logger.error(f"Unexpected parsing error: {e}")
+        logger.error(f"Error getting listings: {e}")
         return []
 
-def format_item(title, link):
-    return f"🖥️ HP ProDesk Alert!\n{title}\n🔗 {link}"
+async def show_all_listings():
+    """Display all current listings at startup"""
+    listings = get_current_listings()
+    if not listings:
+        await send_message("ℹ️ No current listings found")
+        return
+    
+    await send_message(f"📋 Current Inventory ({len(listings)} items):")
+    
+    for i, (link, title, price) in enumerate(listings[:50], 1):  # Limit to first 50 items
+        message = f"{i}. {title}\n💵 {price}\n🔗 {link}"
+        await send_message(message)
+        await asyncio.sleep(0.3)  # Rate limiting
+    
+    global last_items
+    last_items = {item[0] for item in listings}
 
-async def check_listings():
-    """Check for new listings and notify"""
+async def check_new_listings():
+    """Check for any new listings"""
     global last_items
     
-    try:
-        current_items = get_listings()
-        if not current_items:
-            logger.info("No items found in current check")
-            return
-
-        current_links = {item[0] for item in current_items}
-        new_links = current_links - last_items
-
-        if new_links:
-            await send_message(f"🎉 Found {len(new_links)} new HP ProDesk listing(s)!")
-            for link, title in current_items:
-                if link in new_links:
-                    await send_message(format_item(title, link))
-                    await asyncio.sleep(1)  # Rate limiting
-            
-            last_items = current_links
-            
-    except Exception as e:
-        logger.error(f"Check error: {e}")
-        await send_message(f"⚠️ Temporary error: {str(e)[:100]}...")
+    listings = get_current_listings()
+    if not listings:
+        return
+    
+    current_items = {item[0] for item in listings}
+    new_items = current_items - last_items
+    
+    if new_items:
+        await send_message(f"🆕 New Listings Found ({len(new_items)})!")
+        for link, title, price in listings:
+            if link in new_items:
+                message = f"📦 {title}\n💵 {price}\n🔗 {link}"
+                await send_message(message)
+                await asyncio.sleep(0.5)
+        
+        last_items = current_items
 
 async def main():
-    """Main async function"""
-    await send_message(f"🤖 HP ProDesk Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    await send_message(f"🤖 eBay Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     
-    # Initial check
-    initial_items = get_listings()
-    if initial_items:
-        await send_message(f"📋 Found {len(initial_items)} current HP ProDesk listings:")
-        for link, title in initial_items:
-            await send_message(format_item(title, link))
-            await asyncio.sleep(1)
-        
-        global last_items
-        last_items = {item[0] for item in initial_items}
-    else:
-        await send_message("ℹ️ No current HP ProDesk listings found. Monitoring for new items...")
-
-    # Monitoring loop
+    # Show all current listings
+    await show_all_listings()
+    
+    # Start monitoring for new items
     while True:
-        await check_listings()
+        await check_new_listings()
         await asyncio.sleep(CHECK_INTERVAL)
 
 if __name__ == '__main__':
