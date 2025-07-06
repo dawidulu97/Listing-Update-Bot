@@ -13,7 +13,8 @@ TELEGRAM_TOKEN = "7900731557:AAH11XcaZXxnax9MrtFPsd_VUBEkT6NJkCo"
 CHAT_ID = "6848532238"
 SELLER_URLS = [
     "https://www.ebay.com/str/eliminatethedigitaldivide",
-    "https://www.ebay.com/sch/i.html?_saslop=1&_sasl=eliminatethedigitaldivide"
+    "https://www.ebay.com/sch/i.html?_saslop=1&_sasl=eliminatethedigitaldivide",
+    "https://www.ebay.com/sch/eliminatethedigitaldivide/m.html"
 ]
 CHECK_INTERVAL = 600  # 10 minutes
 USER_AGENTS = [
@@ -43,36 +44,51 @@ async def send_message(text):
 def get_random_user_agent():
     return random.choice(USER_AGENTS)
 
-def extract_listings(html):
-    """Improved listing extraction with multiple patterns"""
+def extract_listings_v1(html):
+    """Primary extraction method"""
     items = []
-    patterns = [
+    pattern = re.compile(
         r'<li class="s-item.*?<a href="(.*?)".*?<span role="heading".*?>(.*?)</span>.*?<span class="s-item__price">(.*?)</span>',
-        r'<div class="s-item__wrapper".*?<a href="(.*?)".*?<span class="s-item__title".*?>(.*?)</span>.*?<span class="s-item__price".*?>(.*?)</span>'
-    ]
-    
-    for pattern in patterns:
-        for match in re.finditer(pattern, html, re.DOTALL):
-            link, title, price = match.groups()
-            title = re.sub(r'<.*?>', '', title).strip()
-            price = re.sub(r'<.*?>', '', price).strip()
-            items.append((link, title, price))
-    
+        re.DOTALL
+    )
+    for match in pattern.finditer(html):
+        link, title, price = match.groups()
+        items.append((
+            re.sub(r'\\[uU][0-9a-fA-F]{4}', '', link),  # Clean Unicode escapes
+            re.sub(r'<.*?>', '', title).strip(),
+            re.sub(r'<.*?>', '', price).strip()
+        ))
     return items
 
-async def get_listings_with_retry():
-    """Try multiple URLs with retries and random delays"""
-    for _ in range(3):  # Retry up to 3 times
+def extract_listings_v2(html):
+    """Fallback extraction method"""
+    items = []
+    pattern = re.compile(
+        r'<div class="s-item__info">.*?<a href="(.*?)".*?>(.*?)</a>.*?<span class="s-item__price">(.*?)</span>',
+        re.DOTALL
+    )
+    for match in pattern.finditer(html):
+        link, title, price = match.groups()
+        items.append((
+            link.split('?')[0],  # Clean URL parameters
+            re.sub(r'<.*?>', '', title).strip()[:200],  # Limit title length
+            re.sub(r'[^\d\.\$£€]', '', price)  # Clean price
+        ))
+    return items
+
+async def fetch_listings():
+    """Fetch listings with multiple fallback methods"""
+    for url in random.sample(SELLER_URLS, len(SELLER_URLS)):
         try:
-            url = random.choice(SELLER_URLS)
             headers = {
                 'User-Agent': get_random_user_agent(),
+                'Accept': 'text/html,application/xhtml+xml',
                 'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive'
+                'Referer': 'https://www.ebay.com/',
+                'DNT': '1'
             }
             
-            # Random delay between 2-5 seconds
+            # Random delay to avoid bot detection
             await asyncio.sleep(random.uniform(2, 5))
             
             response = requests.get(
@@ -82,55 +98,64 @@ async def get_listings_with_retry():
             )
             response.raise_for_status()
             
-            return extract_listings(response.text)
-            
+            # Try both extraction methods
+            items = extract_listings_v1(response.text) or extract_listings_v2(response.text)
+            if items:
+                return items
+                
         except requests.exceptions.RequestException as e:
-            logger.warning(f"Attempt failed for {url}: {e}")
-            await asyncio.sleep(5)  # Wait before retry
+            logger.warning(f"Request to {url} failed: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
+            logger.error(f"Unexpected error with {url}: {e}")
     
     return []
 
 async def show_current_inventory():
-    """Display all current listings with better formatting"""
-    listings = await get_listings_with_retry()
-    if not listings:
-        await send_message("⚠️ Could not retrieve current listings. Will keep trying...")
-        return
-    
-    # Remove duplicates
-    unique_listings = []
-    seen_links = set()
-    for item in listings:
-        if item[0] not in seen_links:
-            seen_links.add(item[0])
-            unique_listings.append(item)
-    
-    await send_message(f"📋 Current Inventory ({len(unique_listings)} items)")
-    
-    # Send in batches of 5 items
-    for i in range(0, min(50, len(unique_listings)), 5):
-        batch = unique_listings[i:i+5]
-        message = "\n\n".join(
-            f"{i+j+1}. {title}\n💵 {price}\n🔗 {link}"
-            for j, (link, title, price) in enumerate(batch)
-        )
-        await send_message(message)
-        await asyncio.sleep(1)  # Rate limiting
-    
-    global last_items
-    last_items = {item[0] for item in unique_listings}
+    """Display current inventory with better error handling"""
+    try:
+        listings = await fetch_listings()
+        if not listings:
+            await send_message("⚠️ Could not retrieve current listings. eBay may be blocking requests.")
+            return
+        
+        # Remove duplicates and limit to 30 items
+        unique_listings = []
+        seen = set()
+        for item in listings:
+            if item[0] not in seen:
+                seen.add(item[0])
+                unique_listings.append(item)
+                if len(unique_listings) >= 30:
+                    break
+        
+        await send_message(f"📋 Current Inventory ({len(unique_listings)} items)")
+        
+        # Send in batches
+        for i in range(0, len(unique_listings), 5):
+            batch = unique_listings[i:i+5]
+            message = "\n\n".join(
+                f"{i+j+1}. {title}\n💵 {price}\n🔗 {link}"
+                for j, (link, title, price) in enumerate(batch)
+            )
+            await send_message(message)
+            await asyncio.sleep(1)
+        
+        global last_items
+        last_items = {item[0] for item in unique_listings}
+        
+    except Exception as e:
+        logger.error(f"Error showing inventory: {e}")
+        await send_message(f"⚠️ Inventory error: {str(e)[:100]}...")
 
-async def monitor_new_items():
-    """Monitor for new listings with improved reliability"""
+async def monitor_listings():
+    """Main monitoring loop with robust error handling"""
     global last_items
     
     while True:
         try:
-            listings = await get_listings_with_retry()
+            listings = await fetch_listings()
             if not listings:
-                logger.info("No listings retrieved in this check")
+                logger.info("No listings retrieved - will retry after delay")
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
             
@@ -139,7 +164,7 @@ async def monitor_new_items():
             
             if new_items:
                 new_listings = [item for item in listings if item[0] in new_items]
-                await send_message(f"🆕 New Listings Found ({len(new_listings)})!")
+                await send_message(f"🆕 New Items Found ({len(new_listings)})!")
                 
                 for link, title, price in new_listings:
                     message = f"📦 {title}\n💵 {price}\n🔗 {link}"
@@ -152,17 +177,13 @@ async def monitor_new_items():
             
         except Exception as e:
             logger.error(f"Monitoring error: {e}")
-            await send_message(f"⚠️ Temporary monitoring error: {str(e)[:100]}...")
-            await asyncio.sleep(CHECK_INTERVAL * 2)  # Longer wait after errors
+            await send_message(f"⚠️ Monitoring paused due to error: {str(e)[:100]}...")
+            await asyncio.sleep(CHECK_INTERVAL * 2)  # Extended wait after errors
 
 async def main():
     await send_message(f"🤖 eBay Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    
-    # Initial inventory check
     await show_current_inventory()
-    
-    # Start continuous monitoring
-    await monitor_new_items()
+    await monitor_listings()
 
 if __name__ == '__main__':
     try:
@@ -171,4 +192,3 @@ if __name__ == '__main__':
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-        # Can't send message here since event loop is closed
