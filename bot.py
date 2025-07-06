@@ -22,31 +22,55 @@ def send_message(text):
     bot.send_message(chat_id=CHAT_ID, text=text)
 
 def get_feed_items():
-    """Fetch and parse RSS feed items"""
-    feed = feedparser.parse(EBAY_RSS_URL)
-    return [(entry.link, entry.title) for entry in feed.entries]
+    """Fetch and parse RSS feed items with better error handling"""
+    try:
+        feed = feedparser.parse(EBAY_RSS_URL)
+        if not feed.entries:
+            print("Debug: Feed entries empty - feed status", feed.get('status', 'No status'))
+            print("Debug: Feed contents:", feed)
+            return []
+            
+        items = []
+        for entry in feed.entries:
+            # Some eBay RSS feeds use 'link', others use 'guid'
+            link = entry.get('link') or entry.get('guid', '')
+            if not link:
+                continue
+            title = entry.get('title', 'No Title')
+            pub_date = entry.get('published', '')
+            items.append((link, title, pub_date))
+            
+        return items
+        
+    except Exception as e:
+        print(f"Error parsing feed: {str(e)}")
+        return []
 
-def format_item(title, link):
+def format_item(title, link, pub_date=""):
     """Format item for Telegram message"""
-    return f"🆕 {title}\n🔗 {link}"
+    date_str = f"\n⌚ {pub_date}" if pub_date else ""
+    return f"🆕 {title}{date_str}\n🔗 {link}"
 
 def show_current_listings():
     """Display current listings when bot starts"""
     try:
         items = get_feed_items()
         if not items:
-            send_message("ℹ️ No current listings found")
+            send_message("ℹ️ No current listings found - this may be incorrect. Checking feed format...")
+            # Send debug info to help troubleshoot
+            feed = feedparser.parse(EBAY_RSS_URL)
+            send_message(f"Feed status: {feed.get('status', 'Unknown')}\nFeed URL: {EBAY_RSS_URL}")
             return
 
         send_message(f"📋 Current Listings (Showing {min(MAX_INITIAL_ITEMS, len(items))} most recent):")
         
-        for link, title in items[:MAX_INITIAL_ITEMS]:
-            send_message(format_item(title, link))
+        for link, title, pub_date in items[:MAX_INITIAL_ITEMS]:
+            send_message(format_item(title, link, pub_date))
             time.sleep(0.5)  # Avoid rate limits
 
         # Initialize last_items with current items
         global last_items
-        last_items = {link for link, _ in items}
+        last_items = {link for link, _, _ in items}
         
     except Exception as e:
         send_message(f"❌ Error fetching current listings: {str(e)}")
@@ -60,14 +84,14 @@ def check_new_listings():
         if not current_items:
             return
 
-        current_links = {link for link, _ in current_items}
+        current_links = {link for link, _, _ in current_items}
         new_links = current_links - last_items
 
         if new_links:
             send_message(f"🔔 New Items Found ({len(new_links)})")
-            for link, title in current_items:
+            for link, title, pub_date in current_items:
                 if link in new_links:
-                    send_message(format_item(title, link))
+                    send_message(format_item(title, link, pub_date))
                     time.sleep(0.5)
             
             last_items = current_links
