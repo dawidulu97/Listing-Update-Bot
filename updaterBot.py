@@ -19,7 +19,7 @@ CONFIG = {
         'dest_channel_id': 4719054372
     },
     'EbayConfig': {
-        'appid': 'LaptopTr-notifier-SBX-0c5701265-0f157037'
+        'appid': 'LaptopTr-notifier-PRD-68ea2d757-571ae1d7'
     },
     'EbayFilters': {
         'seller_name': 'eliminatethedigitaldivide'
