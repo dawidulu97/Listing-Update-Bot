@@ -9,9 +9,10 @@ import asyncio
 # Configuration
 TELEGRAM_TOKEN = "7900731557:AAH11XcaZXxnax9MrtFPsd_VUBEkT6NJkCo"
 CHAT_ID = "6848532238"
-EBAY_APP_ID = "LaptopTr-notifier-PRD-68ea2d757-571ae1d7"  # Your Production App ID
+EBAY_APP_ID = "LaptopTr-notifier-PRD-68ea2d757-571ae1d7"
 SELLER_NAME = "eliminatethedigitaldivide"
-CHECK_INTERVAL = 300  # 5 minutes (eBay recommends no more than 10 calls/minute)
+CHECK_INTERVAL = 300  # 5 minutes
+MAX_RETRIES = 3
 
 # Setup logging
 logging.basicConfig(
@@ -31,120 +32,131 @@ async def send_message(text):
     except Exception as e:
         logger.error(f"Unexpected error sending message: {e}")
 
-def get_ebay_listings():
-    """Fetch listings using eBay Finding API with proper error handling"""
-    try:
-        endpoint = "https://svcs.ebay.com/services/search/FindingService/v1"
-        params = {
-            "OPERATION-NAME": "findItemsAdvanced",
-            "SERVICE-VERSION": "1.13.0",
-            "SECURITY-APPNAME": EBAY_APP_ID,
-            "RESPONSE-DATA-FORMAT": "JSON",
-            "REST-PAYLOAD": "",
-            "paginationInput.entriesPerPage": "100",  # Max allowed per call
-            "itemFilter(0).name": "Seller",
-            "itemFilter(0).value": SELLER_NAME,
-            "sortOrder": "StartTimeNewest",  # Get newest items first
-            "outputSelector(0)": "SellerInfo"  # Include seller details
-        }
-        
-        # Add headers to mimic browser request
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
-            "Accept-Language": "en-US"
-        }
-        
-        response = requests.get(
-            endpoint,
-            params=params,
-            headers=headers,
-            timeout=15
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        # Parse API response with error checking
-        items = []
+def make_ebay_api_request():
+    """Make API request with retry logic"""
+    endpoint = "https://svcs.ebay.com/services/search/FindingService/v1"
+    params = {
+        "OPERATION-NAME": "findItemsAdvanced",
+        "SERVICE-VERSION": "1.13.0",
+        "SECURITY-APPNAME": EBAY_APP_ID,
+        "RESPONSE-DATA-FORMAT": "JSON",
+        "REST-PAYLOAD": "",
+        "paginationInput.entriesPerPage": "100",
+        "itemFilter(0).name": "Seller",
+        "itemFilter(0).value": SELLER_NAME,
+        "sortOrder": "StartTimeNewest"
+    }
+    
+    headers = {
+        "X-EBAY-SOA-SECURITY-APPNAME": EBAY_APP_ID,
+        "X-EBAY-SOA-REQUEST-DATA-FORMAT": "JSON",
+        "X-EBAY-SOA-RESPONSE-DATA-FORMAT": "JSON",
+        "User-Agent": "Mozilla/5.0"
+    }
+    
+    for attempt in range(MAX_RETRIES):
         try:
-            search_result = data.get("findItemsAdvancedResponse", [{}])[0].get("searchResult", [{}])[0]
-            if search_result.get("@count", "0") != "0":
-                for item in search_result.get("item", []):
-                    try:
-                        items.append((
-                            item["viewItemURL"][0],
-                            item["title"][0],
-                            item.get("sellingStatus", [{}])[0].get("currentPrice", [{}])[0].get("__value__", "N/A"),
-                            item.get("listingInfo", [{}])[0].get("startTime", [""])[0]
-                        ))
-                    except (KeyError, IndexError) as e:
-                        logger.warning(f"Error parsing item: {e}")
-                        continue
-        except (KeyError, IndexError) as e:
-            logger.error(f"Error parsing API response: {e}")
+            response = requests.get(
+                endpoint,
+                params=params,
+                headers=headers,
+                timeout=15
+            )
+            
+            # Check for eBay API errors
+            if response.status_code == 500:
+                error_msg = response.json().get('errorMessage', {}).get('error', {}).get('message', 'Unknown error')
+                logger.error(f"eBay API error (attempt {attempt + 1}): {error_msg}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                return None
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed (attempt {attempt + 1}): {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
+                continue
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error (attempt {attempt + 1}): {e}")
+            return None
+
+def get_ebay_listings():
+    """Get listings with proper error handling"""
+    try:
+        data = make_ebay_api_request()
+        if not data:
             return []
+        
+        items = []
+        search_result = data.get("findItemsAdvancedResponse", [{}])[0].get("searchResult", [{}])[0]
+        
+        if search_result.get("@count", "0") != "0":
+            for item in search_result.get("item", []):
+                try:
+                    items.append((
+                        item["viewItemURL"][0],
+                        item["title"][0],
+                        item.get("sellingStatus", [{}])[0].get("currentPrice", [{}])[0].get("__value__", "N/A"),
+                        item.get("listingInfo", [{}])[0].get("startTime", [""])[0]
+                    ))
+                except (KeyError, IndexError) as e:
+                    logger.warning(f"Error parsing item: {e}")
+                    continue
         
         return items
         
-    except requests.exceptions.RequestException as e:
-        logger.error(f"eBay API request failed: {e}")
     except Exception as e:
-        logger.error(f"Unexpected eBay API error: {e}")
-    
-    return []
+        logger.error(f"Error processing API response: {e}")
+        return []
 
 async def show_current_inventory():
-    """Display all current listings with proper formatting"""
     listings = get_ebay_listings()
     if not listings:
-        await send_message("⚠️ Could not retrieve current listings from eBay API. Please check your App ID and network connection.")
+        await send_message("⚠️ Could not retrieve current listings. Possible issues:\n"
+                         "1. eBay API is temporarily unavailable\n"
+                         "2. Your App ID may need verification\n"
+                         "3. Seller may have no active listings")
         return
     
     await send_message(f"📋 Current Inventory ({len(listings)} items)")
     
-    # Send in batches of 5 items
-    for i in range(0, min(20, len(listings)), 5):  # Limit to first 20 items
-        batch = listings[i:i+5]
-        message = "\n\n".join(
-            f"{i+j+1}. {title}\n💰 ${price} | 🕒 {start_time[:10]}\n🔗 {link}"
-            for j, (link, title, price, start_time) in enumerate(batch)
-        )
+    for i, (link, title, price, start_time) in enumerate(listings[:10], 1):
+        message = f"{i}. {title}\n💰 ${price} | 🕒 {start_time[:10]}\n🔗 {link}"
         await send_message(message)
-        await asyncio.sleep(1)  # Rate limiting
+        await asyncio.sleep(0.5)
     
     global last_items
     last_items = {item[0] for item in listings}
 
 async def check_new_listings():
-    """Check for new listings with error handling"""
     global last_items
     
-    try:
-        listings = get_ebay_listings()
-        if not listings:
-            logger.info("No listings retrieved from API")
-            return
-        
-        current_items = {item[0] for item in listings}
-        new_items = current_items - last_items
-        
-        if new_items:
-            new_listings = [item for item in listings if item[0] in new_items]
-            await send_message(f"🎉 New Listings Found ({len(new_listings)})!")
-            
-            for link, title, price, start_time in new_listings:
-                message = f"🆕 {title}\n💰 ${price} | 🕒 {start_time[:10]}\n🔗 {link}"
-                await send_message(message)
-                await asyncio.sleep(1)  # Rate limiting
-            
-            last_items = current_items
+    listings = get_ebay_listings()
+    if not listings:
+        logger.info("No listings retrieved")
+        return
     
-    except Exception as e:
-        logger.error(f"Error checking new listings: {e}")
-        await send_message(f"⚠️ Temporary error checking listings: {str(e)[:100]}...")
+    current_items = {item[0] for item in listings}
+    new_items = current_items - last_items
+    
+    if new_items:
+        new_listings = [item for item in listings if item[0] in new_items]
+        await send_message(f"🎉 New Listings Found ({len(new_listings)})!")
+        
+        for link, title, price, start_time in new_listings:
+            message = f"🆕 {title}\n💰 ${price} | 🕒 {start_time[:10]}\n🔗 {link}"
+            await send_message(message)
+            await asyncio.sleep(0.5)
+        
+        last_items = current_items
 
 async def main():
-    await send_message(f"🤖 eBay API Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    await send_message(f"🤖 eBay Monitor Started at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     await show_current_inventory()
     
     while True:
